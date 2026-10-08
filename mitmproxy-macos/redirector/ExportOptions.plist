@@ -5,19 +5,10 @@
 	<key>destination</key>
 	<string>export</string>
 	<key>method</key>
-	<string>developer-id</string>
-	<key>provisioningProfiles</key>
-	<dict>
-		<key>org.mitmproxy.macos-redirector</key>
-		<string>Mitmproxy Redirector</string>
-		<key>org.mitmproxy.macos-redirector.network-extension</key>
-		<string>Mitmproxy Redirector Network Extension</string>
-	</dict>
-	<key>signingCertificate</key>
-	<string>89AACB17FA34CC93BE764A1024FAB6346155A439</string>
+	<string>debugging</string>
 	<key>signingStyle</key>
-	<string>manual</string>
+	<string>automatic</string>
 	<key>teamID</key>
-	<string>S8XHQB96PW</string>
+	<string>CXLYTY8DMR</string>
 </dict>
 </plist>
