@@ -1,0 +1,17 @@
+min_version = "2026.10.1"
+
+[settings]
+experimental = true
+lockfile = true
+
+[env]
+FORK_MANIFEST = "patches/fork.yaml"
+
+[tools]
+rust = "1.99.0"
+"cargo:stgit" = { version = "2.6.1", depends = ["rust"] }
+
+[task_config]
+includes = [
+  "git::https://github.com/victor-software-house/forkctl.git//tasks/fork?ref=v0.0.30",
+]
