@@ -1,0 +1,82 @@
+%YAML 1.2
+---
+schema: 1
+downstream:
+  remote: origin
+  branch: downstream
+  recovery_tag_prefix: forkctl/recovery
+  publish: append
+upstream:
+  remote: upstream
+  url: https://github.com/mitmproxy/mitmproxy_rs.git
+  fetch_ref: refs/heads/main
+base:
+  target:
+    kind: tag
+    selector: refs/tags/v0.12.11
+    commit: 40f1dfb5dca7b03ff7793d3c90f23b8bdf873889
+  canonical: 40f1dfb5dca7b03ff7793d3c90f23b8bdf873889
+  stack: 40f1dfb5dca7b03ff7793d3c90f23b8bdf873889
+documents:
+  ledger: PATCHES.md
+  exports: patches/downstream
+bookkeeping_patch: fork-tooling
+patches:
+  - name: fail-closed-redirector
+    kind: source
+    purpose: >-
+      Keep the macOS transparent proxy running when mitmdump detaches and refuse
+      matching flows until it reattaches, so an intercepted process never reaches the
+      network directly while its proxy restarts.
+    upstream_status: not-submitted
+    drop_when: >-
+      Upstream mitmproxy redirector fails closed for in-scope flows when no
+      controller is attached.
+    scope:
+      - mitmproxy-macos/redirector/network-extension/**
+      - mitmproxy-macos/redirector/macos-redirector/**
+  - name: vsh-identity
+    kind: source
+    purpose: >-
+      Sign the redirector under the Victor Software House team (CXLYTY8DMR) with its
+      own bundle identifiers and development signing, for local installs on our own
+      Macs.
+    upstream_status: "inappropriate: downstream signing identity"
+    drop_when: The fork is retired.
+    scope:
+      - mitmproxy-macos/redirector/macos-redirector.xcodeproj/**
+      - mitmproxy-macos/redirector/ExportOptions.plist
+      - mitmproxy-macos/redirector/network-extension/network_extension.entitlements
+      - mitmproxy-macos/redirector/macos-redirector/macos_redirector.entitlements
+  - name: redirector-reliability
+    kind: source
+    purpose: >-
+      Stop the redirector extension from crashing when NEAppProxyFlow calls its open
+      completion handler twice, keep its lifecycle log at a level macOS persists, and
+      name the fork distinctly from the stock app in System Settings.
+    upstream_status: not-submitted
+    drop_when: >-
+      Upstream guards NEAppProxyFlow.open against a repeated completion and logs the
+      provider lifecycle at notice level, and the fork no longer ships beside the stock
+      redirector.
+    scope:
+      - mitmproxy-macos/redirector/network-extension/**
+      - mitmproxy-macos/redirector/macos-redirector.xcodeproj/project.pbxproj
+  - name: fork-tooling
+    kind: tooling
+    purpose: Own fork policy, generated evidence, and integration configuration.
+    upstream_status: "inappropriate: downstream-only fork maintenance"
+    drop_when: The downstream fork is retired.
+    scope:
+      - patches/fork.yaml
+      - PATCHES.md
+      - patches/downstream/**
+      - mise.toml
+      - mise.lock
+      - FORK.md
+      - AGENTS.md
+disabled_patches: []
+history: []
+contracts:
+  allow_base: []
+  required_text: []

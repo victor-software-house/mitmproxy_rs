@@ -1,0 +1,213 @@
+redirector-reliability
+
+From: Victor Araújo <victor@victor-software-house.com>
+
+Downstream-Reason: Stop the redirector extension from crashing when NEAppProxyFlow calls its open completion handler twice, keep its lifecycle log at a level macOS persists, and name the fork distinctly from the stock app in System Settings.
+Upstream-Status: not-submitted
+Drop-When: Upstream guards NEAppProxyFlow.open against a repeated completion and logs the provider lifecycle at notice level, and the fork no longer ships beside the stock redirector.
+---
+ .../macos-redirector.xcodeproj/project.pbxproj     |   12 +++----
+ .../network-extension/FlowExtensions.swift         |   36 ++++++++++++++++++++
+ .../TransparentProxyProvider.swift                 |   25 +++++++-------
+ 3 files changed, 55 insertions(+), 18 deletions(-)
+
+diff --git a/mitmproxy-macos/redirector/macos-redirector.xcodeproj/project.pbxproj b/mitmproxy-macos/redirector/macos-redirector.xcodeproj/project.pbxproj
+index 7d6bacd..a4e342d 100644
+--- a/mitmproxy-macos/redirector/macos-redirector.xcodeproj/project.pbxproj
++++ b/mitmproxy-macos/redirector/macos-redirector.xcodeproj/project.pbxproj
+@@ -422,7 +422,7 @@
+ 				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
+ 				CODE_SIGN_STYLE = Automatic;
+ 				COMBINE_HIDPI_IMAGES = YES;
+-				CURRENT_PROJECT_VERSION = 1;
++				CURRENT_PROJECT_VERSION = 2;
+ 				DEAD_CODE_STRIPPING = YES;
+ 				DEVELOPMENT_ASSET_PATHS = "";
+ 				DEVELOPMENT_TEAM = "";
+@@ -430,7 +430,7 @@
+ 				ENABLE_HARDENED_RUNTIME = YES;
+ 				ENABLE_PREVIEWS = YES;
+ 				GENERATE_INFOPLIST_FILE = YES;
+-				INFOPLIST_KEY_CFBundleDisplayName = "Mitmproxy Redirector";
++				INFOPLIST_KEY_CFBundleDisplayName = "Mitmproxy Redirector (fail-closed)";
+ 				INFOPLIST_KEY_LSUIElement = YES;
+ 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+ 				LD_RUNPATH_SEARCH_PATHS = (
+@@ -457,7 +457,7 @@
+ 				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
+ 				CODE_SIGN_STYLE = Automatic;
+ 				COMBINE_HIDPI_IMAGES = YES;
+-				CURRENT_PROJECT_VERSION = 1;
++				CURRENT_PROJECT_VERSION = 2;
+ 				DEAD_CODE_STRIPPING = YES;
+ 				DEVELOPMENT_ASSET_PATHS = "";
+ 				DEVELOPMENT_TEAM = "";
+@@ -465,7 +465,7 @@
+ 				ENABLE_HARDENED_RUNTIME = YES;
+ 				ENABLE_PREVIEWS = YES;
+ 				GENERATE_INFOPLIST_FILE = YES;
+-				INFOPLIST_KEY_CFBundleDisplayName = "Mitmproxy Redirector";
++				INFOPLIST_KEY_CFBundleDisplayName = "Mitmproxy Redirector (fail-closed)";
+ 				INFOPLIST_KEY_LSUIElement = YES;
+ 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+ 				LD_RUNPATH_SEARCH_PATHS = (
+@@ -488,7 +488,7 @@
+ 				CODE_SIGN_ENTITLEMENTS = "network-extension/network_extension.entitlements";
+ 				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
+ 				CODE_SIGN_STYLE = Automatic;
+-				CURRENT_PROJECT_VERSION = 1;
++				CURRENT_PROJECT_VERSION = 2;
+ 				DEAD_CODE_STRIPPING = YES;
+ 				DEVELOPMENT_TEAM = "";
+ 				"DEVELOPMENT_TEAM[sdk=macosx*]" = CXLYTY8DMR;
+@@ -520,7 +520,7 @@
+ 				CODE_SIGN_ENTITLEMENTS = "network-extension/network_extension.entitlements";
+ 				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
+ 				CODE_SIGN_STYLE = Automatic;
+-				CURRENT_PROJECT_VERSION = 1;
++				CURRENT_PROJECT_VERSION = 2;
+ 				DEAD_CODE_STRIPPING = YES;
+ 				DEVELOPMENT_TEAM = "";
+ 				"DEVELOPMENT_TEAM[sdk=macosx*]" = CXLYTY8DMR;
+diff --git a/mitmproxy-macos/redirector/network-extension/FlowExtensions.swift b/mitmproxy-macos/redirector/network-extension/FlowExtensions.swift
+index 5d12d24..f41bc69 100644
+--- a/mitmproxy-macos/redirector/network-extension/FlowExtensions.swift
++++ b/mitmproxy-macos/redirector/network-extension/FlowExtensions.swift
+@@ -133,3 +133,39 @@ extension NEAppProxyFlow {
+         self.closeWriteWithError(error)
+     }
+ }
++
++extension NEAppProxyFlow {
++    /// Opens the flow, tolerating a repeated completion. NEAppProxyFlow has called its open
++    /// completion handler a second time (after "The peer closed the flow"), and resuming the
++    /// async bridge's continuation twice crashed the provider with EXC_BAD_ACCESS.
++    func openOnce() async throws {
++        let resumed = ResumeOnce()
++        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
++            open(withLocalEndpoint: nil) { error in
++                guard resumed.claim() else {
++                    log.error("open completed again, ignored: \(String(describing: error), privacy: .public)")
++                    return
++                }
++                if let error {
++                    continuation.resume(throwing: error)
++                } else {
++                    continuation.resume()
++                }
++            }
++        }
++    }
++}
++
++/// True for the first claim only, from any thread.
++final class ResumeOnce: @unchecked Sendable {
++    private let lock = NSLock()
++    private var claimed = false
++
++    func claim() -> Bool {
++        lock.lock()
++        defer { lock.unlock() }
++        if claimed { return false }
++        claimed = true
++        return true
++    }
++}
+diff --git a/mitmproxy-macos/redirector/network-extension/TransparentProxyProvider.swift b/mitmproxy-macos/redirector/network-extension/TransparentProxyProvider.swift
+index d1a904e..b8ab829 100644
+--- a/mitmproxy-macos/redirector/network-extension/TransparentProxyProvider.swift
++++ b/mitmproxy-macos/redirector/network-extension/TransparentProxyProvider.swift
+@@ -23,12 +23,12 @@ class TransparentProxyProvider: NETransparentProxyProvider {
+     var attached = false
+ 
+     override func startProxy(options: [String: Any]? = nil) async throws {
+-        log.debug("Starting proxy...")
++        log.notice("Starting proxy...")
+         // The last spec applies from the start, so flows in scope are refused, not passed,
+         // before any controller attaches.
+         if let actions = UserDefaults.standard.stringArray(forKey: Self.specKey), !actions.isEmpty {
+             self.spec = try? InterceptConf(from: MitmproxyIpc_InterceptConf.with { $0.actions = actions })
+-            log.debug("Restored intercept spec: \(actions, privacy: .public)")
++            log.notice("Restored intercept spec: \(actions, privacy: .public)")
+         }
+ 
+         let proxySettings = NETransparentProxyNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
+@@ -45,7 +45,7 @@ class TransparentProxyProvider: NETransparentProxyProvider {
+             )
+         ]
+         try await setTunnelNetworkSettings(proxySettings)
+-        log.debug("Applied tunnel settings.")
++        log.notice("Applied tunnel settings.")
+ 
+         // The configured socket first, then the last one a controller sent; a dead socket
+         // leaves the proxy detached and refusing until a controller attaches.
+@@ -56,11 +56,11 @@ class TransparentProxyProvider: NETransparentProxyProvider {
+         for path in candidates where !attached {
+             await attach(to: path)
+         }
+-        log.debug("Proxy start complete, attached=\(self.attached, privacy: .public)")
++        log.notice("Proxy start complete, attached=\(self.attached, privacy: .public)")
+     }
+ 
+     override func stopProxy(with reason: NEProviderStopReason) async {
+-        log.debug("stopProxy \(String(describing: reason), privacy: .public)")
++        log.notice("stopProxy \(String(describing: reason), privacy: .public)")
+         detach()
+     }
+ 
+@@ -71,7 +71,7 @@ class TransparentProxyProvider: NETransparentProxyProvider {
+             log.error("Ignoring app message that is not a socket path.")
+             return nil
+         }
+-        log.debug("Controller announced \(path, privacy: .public)")
++        log.notice("Controller announced \(path, privacy: .public)")
+         await attach(to: path)
+         return Data((attached ? "attached" : "detached").utf8)
+     }
+@@ -90,20 +90,21 @@ class TransparentProxyProvider: NETransparentProxyProvider {
+         controlChannel = control
+         attached = true
+         UserDefaults.standard.set(path, forKey: Self.socketKey)
+-        log.debug("Attached to \(path, privacy: .public)")
++        log.notice("Attached to \(path, privacy: .public)")
+         control.stateUpdateHandler = { [weak self] state in
+             if case .failed(let err) = state {
+-                log.debug("Control channel closed (\(err, privacy: .public)); refusing in-scope flows.")
++                log.notice("Control channel closed (\(err, privacy: .public)); refusing in-scope flows.")
+                 self?.detach(control)
+             }
+         }
+         Task { [weak self] in
+             do {
+                 while let spec = try await control.receive(ipc: MitmproxyIpc_InterceptConf.self) {
+-                    log.debug("Received spec: \(String(describing: spec), privacy: .public)")
++                    log.notice("Received spec: \(String(describing: spec), privacy: .public)")
+                     self?.spec = try InterceptConf(from: spec)
+                     UserDefaults.standard.set(spec.actions, forKey: Self.specKey)
+                 }
++                log.notice("Control channel ended; refusing in-scope flows.")
+                 self?.detach(control)
+             } catch {
+                 log.error("Error on control channel: \(String(describing: error), privacy: .public)")
+@@ -127,10 +128,10 @@ class TransparentProxyProvider: NETransparentProxyProvider {
+     /// Takes the flow and closes it with an error: the client sees a failed connection and
+     /// retries, where returning false would send it to the network directly.
+     func refuse(_ flow: NEAppProxyFlow, _ reason: String) -> Bool {
+-        log.debug("Refusing in-scope flow: \(reason, privacy: .public)")
++        log.notice("Refusing in-scope flow: \(reason, privacy: .public)")
+         let error = NSError(domain: NEAppProxyErrorDomain, code: NEAppProxyFlowError.notConnected.rawValue)
+         Task {
+-            try? await flow.open(withLocalEndpoint: nil)
++            try? await flow.openOnce()
+             flow.closeReadWithError(error)
+             flow.closeWriteWithError(error)
+         }
+@@ -172,7 +173,7 @@ class TransparentProxyProvider: NETransparentProxyProvider {
+         Task {
+             do {
+                 log.debug("Intercepting...")
+-                try await flow.open(withLocalEndpoint: nil)
++                try await flow.openOnce()
+ 
+                 let conn = NWConnection(
+                     to: .unix(path: unixSocket),
