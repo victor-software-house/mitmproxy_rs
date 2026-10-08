@@ -133,3 +133,39 @@ extension NEAppProxyFlow {
         self.closeWriteWithError(error)
     }
 }
+
+extension NEAppProxyFlow {
+    /// Opens the flow, tolerating a repeated completion. NEAppProxyFlow has called its open
+    /// completion handler a second time (after "The peer closed the flow"), and resuming the
+    /// async bridge's continuation twice crashed the provider with EXC_BAD_ACCESS.
+    func openOnce() async throws {
+        let resumed = ResumeOnce()
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            open(withLocalEndpoint: nil) { error in
+                guard resumed.claim() else {
+                    log.error("open completed again, ignored: \(String(describing: error), privacy: .public)")
+                    return
+                }
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume()
+                }
+            }
+        }
+    }
+}
+
+/// True for the first claim only, from any thread.
+final class ResumeOnce: @unchecked Sendable {
+    private let lock = NSLock()
+    private var claimed = false
+
+    func claim() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if claimed { return false }
+        claimed = true
+        return true
+    }
+}
