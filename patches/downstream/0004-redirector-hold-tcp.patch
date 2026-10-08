@@ -1,0 +1,201 @@
+redirector-hold-tcp
+
+From: Victor Araújo <victor@victor-software-house.com>
+
+Downstream-Reason: Divert only TCP to the extension, hold in-scope flows for a bounded time while no controller is attached instead of refusing them at once, and answer a status app message, so a router restart costs clients no retries and DNS never depends on the router.
+Upstream-Status: not-submitted
+Drop-When: The redirector is replaced by the session-billing extension with declarative flow rules (OpenSpec follow-up to L1).
+---
+ .../macos-redirector.xcodeproj/project.pbxproj     |    8 +-
+ .../TransparentProxyProvider.swift                 |   80 +++++++++++++++++---
+ 2 files changed, 73 insertions(+), 15 deletions(-)
+
+diff --git a/mitmproxy-macos/redirector/macos-redirector.xcodeproj/project.pbxproj b/mitmproxy-macos/redirector/macos-redirector.xcodeproj/project.pbxproj
+index eacae97..c4ac191 100644
+--- a/mitmproxy-macos/redirector/macos-redirector.xcodeproj/project.pbxproj
++++ b/mitmproxy-macos/redirector/macos-redirector.xcodeproj/project.pbxproj
+@@ -422,7 +422,7 @@
+ 				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
+ 				CODE_SIGN_STYLE = Automatic;
+ 				COMBINE_HIDPI_IMAGES = YES;
+-				CURRENT_PROJECT_VERSION = 3;
++				CURRENT_PROJECT_VERSION = 4;
+ 				DEAD_CODE_STRIPPING = YES;
+ 				DEVELOPMENT_ASSET_PATHS = "";
+ 				DEVELOPMENT_TEAM = "";
+@@ -457,7 +457,7 @@
+ 				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
+ 				CODE_SIGN_STYLE = Automatic;
+ 				COMBINE_HIDPI_IMAGES = YES;
+-				CURRENT_PROJECT_VERSION = 3;
++				CURRENT_PROJECT_VERSION = 4;
+ 				DEAD_CODE_STRIPPING = YES;
+ 				DEVELOPMENT_ASSET_PATHS = "";
+ 				DEVELOPMENT_TEAM = "";
+@@ -488,7 +488,7 @@
+ 				CODE_SIGN_ENTITLEMENTS = "network-extension/network_extension.entitlements";
+ 				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
+ 				CODE_SIGN_STYLE = Automatic;
+-				CURRENT_PROJECT_VERSION = 3;
++				CURRENT_PROJECT_VERSION = 4;
+ 				DEAD_CODE_STRIPPING = YES;
+ 				DEVELOPMENT_TEAM = "";
+ 				"DEVELOPMENT_TEAM[sdk=macosx*]" = CXLYTY8DMR;
+@@ -520,7 +520,7 @@
+ 				CODE_SIGN_ENTITLEMENTS = "network-extension/network_extension.entitlements";
+ 				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
+ 				CODE_SIGN_STYLE = Automatic;
+-				CURRENT_PROJECT_VERSION = 3;
++				CURRENT_PROJECT_VERSION = 4;
+ 				DEAD_CODE_STRIPPING = YES;
+ 				DEVELOPMENT_TEAM = "";
+ 				"DEVELOPMENT_TEAM[sdk=macosx*]" = CXLYTY8DMR;
+diff --git a/mitmproxy-macos/redirector/network-extension/TransparentProxyProvider.swift b/mitmproxy-macos/redirector/network-extension/TransparentProxyProvider.swift
+index b8ab829..1529aca 100644
+--- a/mitmproxy-macos/redirector/network-extension/TransparentProxyProvider.swift
++++ b/mitmproxy-macos/redirector/network-extension/TransparentProxyProvider.swift
+@@ -10,11 +10,20 @@ enum TransparentProxyError: Error {
+ }
+ 
+ /// Fails closed: the proxy keeps running when mitmdump detaches, keeps the last intercept spec,
+-/// and refuses in-scope flows until a controller attaches again. A process in scope therefore
+-/// never reaches the network directly while its proxy restarts; its connections fail and retry.
++/// and holds in-scope flows until a controller attaches again, refusing a flow only once it
++/// waited `holdSeconds`. A process in scope therefore never reaches the network directly while
++/// its proxy restarts; a short restart only delays its connections.
+ class TransparentProxyProvider: NETransparentProxyProvider {
+     static let specKey = "lastInterceptActions"
+     static let socketKey = "lastUnixSocket"
++    /// How long an in-scope flow waits for a controller before it is refused.
++    static let holdSeconds = 30.0
++
++    /// Guards `attached`, `unixSocket` and `held` together: a flow is either held before an
++    /// attach drains the queue, or sees the attach and is intercepted.
++    let state = NSLock()
++    /// In-scope flows waiting for a controller.
++    var held: [(flow: NEAppProxyFlow, processInfo: ProcessInfo)] = []
+ 
+     var unixSocket: String?
+     var controlChannel: NWConnection?
+@@ -38,7 +47,9 @@ class TransparentProxyProvider: NETransparentProxyProvider {
+                 remotePrefix: 0,
+                 localNetwork: nil,
+                 localPrefix: 0,
+-                protocol: .any,
++                // Only TCP reaches the provider: UDP, DNS included, goes to the network as if
++                // no proxy ran, and never depends on a controller.
++                protocol: .TCP,
+                 // https://developer.apple.com/documentation/networkextension/netransparentproxynetworksettings/3143656-includednetworkrules:
+                 // The matchDirection property must be NETrafficDirection.outbound.
+                 direction: .outbound
+@@ -66,9 +77,14 @@ class TransparentProxyProvider: NETransparentProxyProvider {
+ 
+     /// A new controller announces its socket path; the running proxy attaches to it, so a
+     /// mitmdump restart never stops the proxy.
++    /// `status` answers the provider's state without changing it.
+     override func handleAppMessage(_ messageData: Data) async -> Data? {
+-        guard let path = String(data: messageData, encoding: .utf8), path.hasPrefix("/tmp/") else {
+-            log.error("Ignoring app message that is not a socket path.")
++        let text = String(data: messageData, encoding: .utf8)
++        if text == "status" {
++            return Data(status().utf8)
++        }
++        guard let path = text, path.hasPrefix("/tmp/") else {
++            log.error("Ignoring app message that is neither status nor a socket path.")
+             return nil
+         }
+         log.notice("Controller announced \(path, privacy: .public)")
+@@ -86,11 +102,18 @@ class TransparentProxyProvider: NETransparentProxyProvider {
+             control.forceCancel()
+             return
+         }
+-        unixSocket = path
+         controlChannel = control
++        state.lock()
++        unixSocket = path
+         attached = true
++        let waiting = held
++        held = []
++        state.unlock()
+         UserDefaults.standard.set(path, forKey: Self.socketKey)
+-        log.notice("Attached to \(path, privacy: .public)")
++        log.notice("Attached to \(path, privacy: .public); releasing \(waiting.count, privacy: .public) held flows")
++        for (flow, processInfo) in waiting {
++            intercept(flow, processInfo, via: path)
++        }
+         control.stateUpdateHandler = { [weak self] state in
+             if case .failed(let err) = state {
+                 log.notice("Control channel closed (\(err, privacy: .public)); refusing in-scope flows.")
+@@ -121,8 +144,33 @@ class TransparentProxyProvider: NETransparentProxyProvider {
+         }
+         controlChannel?.forceCancel()
+         controlChannel = nil
++        state.lock()
+         unixSocket = nil
+         attached = false
++        state.unlock()
++    }
++
++    func status() -> String {
++        state.lock()
++        defer { state.unlock() }
++        return "attached=\(attached) held=\(held.count) socket=\(unixSocket ?? "none") spec=\(spec != nil)"
++    }
++
++    /// Keeps the flow until a controller attaches; refuses it if none does in `holdSeconds`.
++    /// Called with `state` locked.
++    func hold(_ flow: NEAppProxyFlow, _ processInfo: ProcessInfo) {
++        held.append((flow, processInfo))
++        log.notice("Holding in-scope flow until a controller attaches (\(self.held.count, privacy: .public) held)")
++        DispatchQueue.global().asyncAfter(deadline: .now() + Self.holdSeconds) { [weak self] in
++            guard let self else { return }
++            self.state.lock()
++            let index = self.held.firstIndex { $0.flow === flow }
++            if let index { self.held.remove(at: index) }
++            self.state.unlock()
++            if index != nil {
++                _ = self.refuse(flow, "no controller attached within \(Self.holdSeconds) s")
++            }
++        }
+     }
+ 
+     /// Takes the flow and closes it with an error: the client sees a failed connection and
+@@ -159,16 +207,27 @@ class TransparentProxyProvider: NETransparentProxyProvider {
+         }
+         log.debug("Handling new flow: \(String(describing: processInfo), privacy: .public)")
+ 
+-        guard attached, let unixSocket = self.unixSocket else {
+-            return refuse(flow, "no controller attached")
++        state.lock()
++        let socket = attached ? unixSocket : nil
++        if socket == nil {
++            hold(flow, processInfo)
++        }
++        state.unlock()
++        if let socket {
++            intercept(flow, processInfo, via: socket)
+         }
++        return true
++    }
+ 
++    /// Hands the flow to the controller listening on `unixSocket`.
++    func intercept(_ flow: NEAppProxyFlow, _ processInfo: ProcessInfo, via unixSocket: String) {
+         let message: MitmproxyIpc_NewFlow
+         do {
+             message = try self.makeIpcHandshake(flow: flow, processInfo: processInfo)
+         } catch {
+             log.error("Failed to create IPC handshake: \(error, privacy: .public), flow=\(flow, privacy: .public)")
+-            return refuse(flow, "no IPC handshake")
++            _ = refuse(flow, "no IPC handshake")
++            return
+         }
+         Task {
+             do {
+@@ -203,7 +262,6 @@ class TransparentProxyProvider: NETransparentProxyProvider {
+                 flow.closeWriteWithError(error)
+             }
+         }
+-        return true
+     }
+ 
+     func makeIpcHandshake(flow: NEAppProxyFlow, processInfo: ProcessInfo) throws -> MitmproxyIpc_NewFlow {
