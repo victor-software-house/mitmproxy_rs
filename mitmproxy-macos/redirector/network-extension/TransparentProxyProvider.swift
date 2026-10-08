@@ -23,12 +23,12 @@ class TransparentProxyProvider: NETransparentProxyProvider {
     var attached = false
 
     override func startProxy(options: [String: Any]? = nil) async throws {
-        log.debug("Starting proxy...")
+        log.notice("Starting proxy...")
         // The last spec applies from the start, so flows in scope are refused, not passed,
         // before any controller attaches.
         if let actions = UserDefaults.standard.stringArray(forKey: Self.specKey), !actions.isEmpty {
             self.spec = try? InterceptConf(from: MitmproxyIpc_InterceptConf.with { $0.actions = actions })
-            log.debug("Restored intercept spec: \(actions, privacy: .public)")
+            log.notice("Restored intercept spec: \(actions, privacy: .public)")
         }
 
         let proxySettings = NETransparentProxyNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
@@ -45,7 +45,7 @@ class TransparentProxyProvider: NETransparentProxyProvider {
             )
         ]
         try await setTunnelNetworkSettings(proxySettings)
-        log.debug("Applied tunnel settings.")
+        log.notice("Applied tunnel settings.")
 
         // The configured socket first, then the last one a controller sent; a dead socket
         // leaves the proxy detached and refusing until a controller attaches.
@@ -56,11 +56,11 @@ class TransparentProxyProvider: NETransparentProxyProvider {
         for path in candidates where !attached {
             await attach(to: path)
         }
-        log.debug("Proxy start complete, attached=\(self.attached, privacy: .public)")
+        log.notice("Proxy start complete, attached=\(self.attached, privacy: .public)")
     }
 
     override func stopProxy(with reason: NEProviderStopReason) async {
-        log.debug("stopProxy \(String(describing: reason), privacy: .public)")
+        log.notice("stopProxy \(String(describing: reason), privacy: .public)")
         detach()
     }
 
@@ -71,7 +71,7 @@ class TransparentProxyProvider: NETransparentProxyProvider {
             log.error("Ignoring app message that is not a socket path.")
             return nil
         }
-        log.debug("Controller announced \(path, privacy: .public)")
+        log.notice("Controller announced \(path, privacy: .public)")
         await attach(to: path)
         return Data((attached ? "attached" : "detached").utf8)
     }
@@ -90,20 +90,21 @@ class TransparentProxyProvider: NETransparentProxyProvider {
         controlChannel = control
         attached = true
         UserDefaults.standard.set(path, forKey: Self.socketKey)
-        log.debug("Attached to \(path, privacy: .public)")
+        log.notice("Attached to \(path, privacy: .public)")
         control.stateUpdateHandler = { [weak self] state in
             if case .failed(let err) = state {
-                log.debug("Control channel closed (\(err, privacy: .public)); refusing in-scope flows.")
+                log.notice("Control channel closed (\(err, privacy: .public)); refusing in-scope flows.")
                 self?.detach(control)
             }
         }
         Task { [weak self] in
             do {
                 while let spec = try await control.receive(ipc: MitmproxyIpc_InterceptConf.self) {
-                    log.debug("Received spec: \(String(describing: spec), privacy: .public)")
+                    log.notice("Received spec: \(String(describing: spec), privacy: .public)")
                     self?.spec = try InterceptConf(from: spec)
                     UserDefaults.standard.set(spec.actions, forKey: Self.specKey)
                 }
+                log.notice("Control channel ended; refusing in-scope flows.")
                 self?.detach(control)
             } catch {
                 log.error("Error on control channel: \(String(describing: error), privacy: .public)")
@@ -127,10 +128,10 @@ class TransparentProxyProvider: NETransparentProxyProvider {
     /// Takes the flow and closes it with an error: the client sees a failed connection and
     /// retries, where returning false would send it to the network directly.
     func refuse(_ flow: NEAppProxyFlow, _ reason: String) -> Bool {
-        log.debug("Refusing in-scope flow: \(reason, privacy: .public)")
+        log.notice("Refusing in-scope flow: \(reason, privacy: .public)")
         let error = NSError(domain: NEAppProxyErrorDomain, code: NEAppProxyFlowError.notConnected.rawValue)
         Task {
-            try? await flow.open(withLocalEndpoint: nil)
+            try? await flow.openOnce()
             flow.closeReadWithError(error)
             flow.closeWriteWithError(error)
         }
@@ -172,7 +173,7 @@ class TransparentProxyProvider: NETransparentProxyProvider {
         Task {
             do {
                 log.debug("Intercepting...")
-                try await flow.open(withLocalEndpoint: nil)
+                try await flow.openOnce()
 
                 let conn = NWConnection(
                     to: .unix(path: unixSocket),
