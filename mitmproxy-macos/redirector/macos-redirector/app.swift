@@ -5,7 +5,8 @@ import SwiftUI
 import SystemExtensions
 
 let log = Logger(subsystem: "org.mitmproxy.macos-redirector", category: "app")
-let networkExtensionIdentifier = "org.mitmproxy.macos-redirector.network-extension"
+// The extension is the app's bundle identifier plus this suffix, under any signing identity.
+let networkExtensionIdentifier = Bundle.main.bundleIdentifier! + ".network-extension"
 
 /// Helper app to install the system extension and setup the transaprent proxy.
 @main
@@ -90,12 +91,29 @@ class SystemExtensionInstaller: NSObject, OSSystemExtensionRequestDelegate {
 
 func startProxy(unixSocketPath: String) async throws {
     let savedManagers = try await NETransparentProxyManager.loadAllFromPreferences()
-    let manager =
-        savedManagers.first(where: { m in
-            (m.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier
-                == networkExtensionIdentifier
-                && (!m.isEnabled || m.connection.status != NEVPNStatus.connected)
-        }) ?? NETransparentProxyManager()
+    let ours = savedManagers.filter { m in
+        (m.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier
+            == networkExtensionIdentifier
+    }
+
+    // A proxy already running keeps running: the new controller only announces its socket.
+    // Restarting the tunnel would leave a window in which nothing is redirected.
+    if let running = ours.first(where: { $0.isEnabled && $0.connection.status == .connected }),
+       let session = running.connection as? NETunnelProviderSession
+    {
+        let reply: Data? = try await withCheckedThrowingContinuation { continuation in
+            do {
+                try session.sendProviderMessage(Data(unixSocketPath.utf8)) { continuation.resume(returning: $0) }
+            } catch {
+                continuation.resume(throwing: error)
+            }
+        }
+        let state = reply.flatMap { String(data: $0, encoding: .utf8) } ?? "no reply"
+        log.debug("Announced \(unixSocketPath, privacy: .public) to the running proxy: \(state, privacy: .public)")
+        return
+    }
+
+    let manager = ours.first ?? NETransparentProxyManager()
 
     let providerProtocol = NETunnelProviderProtocol()
     providerProtocol.providerBundleIdentifier = networkExtensionIdentifier
@@ -113,6 +131,10 @@ func startProxy(unixSocketPath: String) async throws {
     manager.protocolConfiguration = providerProtocol
     manager.localizedDescription = "mitmproxy"
     manager.isEnabled = true
+    // The system starts the proxy again on its own (boot, network change, a crash), so the
+    // fail-closed policy holds without mitmdump launching this app.
+    manager.onDemandRules = [NEOnDemandRuleConnect()]
+    manager.isOnDemandEnabled = true
 
     try await manager.saveToPreferences()
     // https://stackoverflow.com/a/47569982/934719 - we need to call load again before starting the tunnel.

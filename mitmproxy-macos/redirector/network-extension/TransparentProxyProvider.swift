@@ -4,57 +4,32 @@ import Network
 import NetworkExtension
 
 enum TransparentProxyError: Error {
-    case serverAddressMissing
     case noRemoteEndpoint
     case noLocalEndpoint
     case unexpectedFlow
 }
 
+/// Fails closed: the proxy keeps running when mitmdump detaches, keeps the last intercept spec,
+/// and refuses in-scope flows until a controller attaches again. A process in scope therefore
+/// never reaches the network directly while its proxy restarts; its connections fail and retry.
 class TransparentProxyProvider: NETransparentProxyProvider {
+    static let specKey = "lastInterceptActions"
+    static let socketKey = "lastUnixSocket"
+
     var unixSocket: String?
     var controlChannel: NWConnection?
     var spec: InterceptConf?
+    /// True only while a controller's control channel is established.
+    var attached = false
 
     override func startProxy(options: [String: Any]? = nil) async throws {
         log.debug("Starting proxy...")
-
-        guard let unixSocket = self.protocolConfiguration.serverAddress
-        else { throw TransparentProxyError.serverAddressMissing }
-        self.unixSocket = unixSocket
-        log.debug("Establishing control channel via \(unixSocket, privacy: .public)...")
-        let control = NWConnection(
-            to: .unix(path: unixSocket),
-            using: .tcp
-        )
-        controlChannel = control
-        try await control.establish()
-        control.stateUpdateHandler = { state in
-            switch state {
-            case .failed(.posix(.ENETDOWN)):
-                log.debug("control channel closed, stopping proxy.")
-                control.forceCancel()
-                self.cancelProxyWithError(.none)
-            case .failed(let err):
-                log.error("control channel failed: \(err, privacy: .public)")
-                control.forceCancel()
-                self.cancelProxyWithError(err)
-            default:
-                break
-            }
+        // The last spec applies from the start, so flows in scope are refused, not passed,
+        // before any controller attaches.
+        if let actions = UserDefaults.standard.stringArray(forKey: Self.specKey), !actions.isEmpty {
+            self.spec = try? InterceptConf(from: MitmproxyIpc_InterceptConf.with { $0.actions = actions })
+            log.debug("Restored intercept spec: \(actions, privacy: .public)")
         }
-        Task {
-            do {
-                while let spec = try await control.receive(ipc: MitmproxyIpc_InterceptConf.self) {
-                    log.debug("Received spec: \(String(describing: spec), privacy: .public)")
-                    self.spec = try InterceptConf(from: spec)
-                }
-            } catch {
-                log.error("Error on control channel: \(String(describing: error), privacy: .public)")
-                control.forceCancel()
-                self.cancelProxyWithError(error)
-            }
-        }
-        log.debug("Established. Applying tunnel settings...")
 
         let proxySettings = NETransparentProxyNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
         proxySettings.includedNetworkRules = [
@@ -69,14 +44,97 @@ class TransparentProxyProvider: NETransparentProxyProvider {
                 direction: .outbound
             )
         ]
-
         try await setTunnelNetworkSettings(proxySettings)
-        log.debug("Applied. Proxy start complete.")
+        log.debug("Applied tunnel settings.")
+
+        // The configured socket first, then the last one a controller sent; a dead socket
+        // leaves the proxy detached and refusing until a controller attaches.
+        let candidates = [
+            (self.protocolConfiguration as? NETunnelProviderProtocol)?.serverAddress,
+            UserDefaults.standard.string(forKey: Self.socketKey),
+        ].compactMap { $0 }
+        for path in candidates where !attached {
+            await attach(to: path)
+        }
+        log.debug("Proxy start complete, attached=\(self.attached, privacy: .public)")
     }
 
     override func stopProxy(with reason: NEProviderStopReason) async {
         log.debug("stopProxy \(String(describing: reason), privacy: .public)")
-        self.controlChannel?.forceCancel()
+        detach()
+    }
+
+    /// A new controller announces its socket path; the running proxy attaches to it, so a
+    /// mitmdump restart never stops the proxy.
+    override func handleAppMessage(_ messageData: Data) async -> Data? {
+        guard let path = String(data: messageData, encoding: .utf8), path.hasPrefix("/tmp/") else {
+            log.error("Ignoring app message that is not a socket path.")
+            return nil
+        }
+        log.debug("Controller announced \(path, privacy: .public)")
+        await attach(to: path)
+        return Data((attached ? "attached" : "detached").utf8)
+    }
+
+    func attach(to path: String) async {
+        detach()
+        let control = NWConnection(to: .unix(path: path), using: .tcp)
+        do {
+            try await control.establish()
+        } catch {
+            log.error("Control channel to \(path, privacy: .public) failed: \(error, privacy: .public)")
+            control.forceCancel()
+            return
+        }
+        unixSocket = path
+        controlChannel = control
+        attached = true
+        UserDefaults.standard.set(path, forKey: Self.socketKey)
+        log.debug("Attached to \(path, privacy: .public)")
+        control.stateUpdateHandler = { [weak self] state in
+            if case .failed(let err) = state {
+                log.debug("Control channel closed (\(err, privacy: .public)); refusing in-scope flows.")
+                self?.detach(control)
+            }
+        }
+        Task { [weak self] in
+            do {
+                while let spec = try await control.receive(ipc: MitmproxyIpc_InterceptConf.self) {
+                    log.debug("Received spec: \(String(describing: spec), privacy: .public)")
+                    self?.spec = try InterceptConf(from: spec)
+                    UserDefaults.standard.set(spec.actions, forKey: Self.specKey)
+                }
+                self?.detach(control)
+            } catch {
+                log.error("Error on control channel: \(String(describing: error), privacy: .public)")
+                self?.detach(control)
+            }
+        }
+    }
+
+    /// Drops the controller, or only the given one if it is still the current one.
+    /// The proxy and the spec stay.
+    func detach(_ which: NWConnection? = nil) {
+        if let which = which, which !== controlChannel {
+            return
+        }
+        controlChannel?.forceCancel()
+        controlChannel = nil
+        unixSocket = nil
+        attached = false
+    }
+
+    /// Takes the flow and closes it with an error: the client sees a failed connection and
+    /// retries, where returning false would send it to the network directly.
+    func refuse(_ flow: NEAppProxyFlow, _ reason: String) -> Bool {
+        log.debug("Refusing in-scope flow: \(reason, privacy: .public)")
+        let error = NSError(domain: NEAppProxyErrorDomain, code: NEAppProxyFlowError.notConnected.rawValue)
+        Task {
+            try? await flow.open(withLocalEndpoint: nil)
+            flow.closeReadWithError(error)
+            flow.closeWriteWithError(error)
+        }
+        return true
     }
 
     override func handleNewFlow(_ flow: NEAppProxyFlow) -> Bool {
@@ -84,37 +142,40 @@ class TransparentProxyProvider: NETransparentProxyProvider {
         // We first want to figure out if we want to intercept this one.
         // Our intercept specs are based on process name and pid, so we first need to convert from
         // audit token to that.
-        
+
         let processInfo = ProcessInfoCache.getInfo(fromAuditToken: flow.metaData.sourceAppAuditToken)
         guard let processInfo = processInfo else {
             log.debug("Skipping flow without process info.")
             return false
         }
-        log.debug("Handling new flow: \(String(describing: processInfo), privacy: .public)")
 
         guard let spec = self.spec else {
             log.debug("Skipping flow, no intercept spec provided.")
             return false
         }
         guard spec.shouldIntercept(processInfo) else {
-            log.debug("Flow not in scope, leaving it to the system.")
             return false
         }
-        
+        log.debug("Handling new flow: \(String(describing: processInfo), privacy: .public)")
+
+        guard attached, let unixSocket = self.unixSocket else {
+            return refuse(flow, "no controller attached")
+        }
+
         let message: MitmproxyIpc_NewFlow
         do {
             message = try self.makeIpcHandshake(flow: flow, processInfo: processInfo)
         } catch {
             log.error("Failed to create IPC handshake: \(error, privacy: .public), flow=\(flow, privacy: .public)")
-            return false
+            return refuse(flow, "no IPC handshake")
         }
         Task {
             do {
                 log.debug("Intercepting...")
                 try await flow.open(withLocalEndpoint: nil)
-                
+
                 let conn = NWConnection(
-                    to: .unix(path: self.unixSocket!),
+                    to: .unix(path: unixSocket),
                     using: .tcp
                 )
                 do {
@@ -124,10 +185,10 @@ class TransparentProxyProvider: NETransparentProxyProvider {
                     flow.closeWriteWithError(error)
                     throw error
                 }
-                
+
                 try await conn.send(ipc: message)
                 log.debug("Handshake sent.")
-                
+
                 if let tcp_flow = flow as? NEAppProxyTCPFlow {
                     tcp_flow.outboundCopier(conn)
                     tcp_flow.inboundCopier(conn)
@@ -143,7 +204,7 @@ class TransparentProxyProvider: NETransparentProxyProvider {
         }
         return true
     }
-    
+
     func makeIpcHandshake(flow: NEAppProxyFlow, processInfo: ProcessInfo) throws -> MitmproxyIpc_NewFlow {
         let tunnelInfo = MitmproxyIpc_TunnelInfo.with {
             $0.pid = processInfo.pid
